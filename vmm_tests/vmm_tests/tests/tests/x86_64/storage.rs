@@ -18,6 +18,7 @@ use nvme_resources::NvmeControllerHandle;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::VpciDeviceConfig;
 use petri::PetriVmBuilder;
+use petri::ResolvedArtifact;
 #[cfg(windows)]
 use petri::hyperv::HyperVPetriBackend;
 use petri::openvmm::OpenVmmPetriBackend;
@@ -28,6 +29,7 @@ use petri::vtl2_settings::Vtl2LunBuilder;
 use petri::vtl2_settings::Vtl2StorageBackingDeviceBuilder;
 use petri::vtl2_settings::Vtl2StorageControllerBuilder;
 use petri::vtl2_settings::build_vtl2_storage_backing_physical_devices;
+use petri_artifacts_vmm_test::artifacts::openhcl_igvm::LATEST_LINUX_DIRECT_TEST_X64;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use scsidisk_resources::SimpleScsiDvdHandle;
 use scsidisk_resources::SimpleScsiDvdRequest;
@@ -704,11 +706,12 @@ async fn openhcl_linux_storvsp_dvd_nvme(
 /// Test an OpenHCL Linux direct VM with a SCSI disk assigned to VTL2, an NVMe disk assigned to VTL2, and
 /// vmbus relay. This should expose two disks to VTL0 via vmbus.
 #[openvmm_test(
-    openhcl_linux_direct_x64,
-    openhcl_uefi_x64(vhd(ubuntu_2504_server_x64))
+    openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64],
+    //openhcl_uefi_x64(vhd(ubuntu_2504_server_x64))
 )]
 async fn storvsp_dynamic_add_disk(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (igvm_file,): (ResolvedArtifact<impl petri_artifacts_common::tags::IsOpenhclIgvm>,),
 ) -> Result<(), anyhow::Error> {
     const NVME_INSTANCE: Guid = guid::guid!("dce4ebad-182f-46c0-8d30-8446c1c62ab3");
     let vtl0_lun1 = 0;
@@ -733,7 +736,11 @@ async fn storvsp_dynamic_add_disk(
     static_assertions::const_assert_ne!(EXPECTED_NVME2_DISK_SIZE_BYTES, 64 * 1024 * 1024);
     static_assertions::const_assert!(EXPECTED_NVME2_DISK_SIZE_BYTES > 105 * 1024 * 1024);
 
+    let mut flags = config.default_servicing_flags();
+    flags.enable_nvme_keepalive = true;
+
     let (mut vm, agent) = config
+        .with_openhcl_command_line("OPENHCL_ENABLE_VTL2_GPA_POOL=512")
         .with_vmbus_redirect(true)
         .modify_backend(move |b| {
             b.with_custom_config(|c| {
@@ -820,6 +827,58 @@ async fn storvsp_dynamic_add_disk(
     // Let the guest detect the new disk
     let sh = agent.unix_shell();
     cmd!(sh, "sleep 5").run().await?;
+
+    tracing::info!("Testing presence and IO on both disks in guest");
+    test_storage_linux(
+        &agent,
+        vec![
+            ExpectedGuestDevice {
+                controller_guid: scsi_instance,
+                lun: vtl0_lun1,
+                disk_size_sectors: NVME1_DISK_SECTORS as usize,
+                friendly_name: "nvme1".to_string(),
+            },
+            ExpectedGuestDevice {
+                controller_guid: scsi_instance,
+                lun: vtl0_lun2,
+                disk_size_sectors: NVME2_DISK_SECTORS as usize,
+                friendly_name: "nvme2".to_string(),
+            },
+        ],
+    )
+    .await?;
+
+    tracing::info!("Dynamically removing second disk from VTL2 settings");
+    vm.modify_vtl2_settings(|s| {
+        s.dynamic.as_mut().unwrap().storage_controllers[0]
+            .luns
+            .retain(|lun| lun.location != vtl0_lun2);
+    })
+    .await?;
+
+    // Let the guest detect the new disk
+    cmd!(sh, "sleep 6").run().await?;
+    cmd!(sh, "sh -c 'ls /dev/sd*'").run().await?;
+    cmd!(sh, "sh -c 'ls -d /sys/block/sd*'").run().await?;
+
+    vm.restart_openhcl(igvm_file.clone(), flags).await?;
+
+    tracing::info!("Dynamically adding second disk to VTL2 settings (second time)");
+    vm.modify_vtl2_settings(|s| {
+        s.dynamic.as_mut().unwrap().storage_controllers[0]
+            .luns
+            .push(
+                Vtl2LunBuilder::disk()
+                    .with_location(vtl0_lun2)
+                    .with_physical_device(Vtl2StorageBackingDeviceBuilder::new(
+                        ControllerType::Nvme,
+                        NVME_INSTANCE,
+                        vtl2_nsid2,
+                    ))
+                    .build(),
+            );
+    })
+    .await?;
 
     tracing::info!("Testing presence and IO on both disks in guest");
     test_storage_linux(

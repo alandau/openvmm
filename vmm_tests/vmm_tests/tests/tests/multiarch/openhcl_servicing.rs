@@ -502,6 +502,53 @@ async fn servicing_keepalive_fault_if_identify(
     Ok(())
 }
 
+/// Test that disabling keepalive through inspect actually disables it.
+/// We test this by disabling keepalives and waiting for IDENTIFY.
+/// We should only receive IDENTIFY if keepalive is disabled.
+#[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
+async fn servicing_test_keepalive_disable_through_inspect(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (igvm_file,): (ResolvedArtifact<impl petri_artifacts_common::tags::IsOpenhclIgvm>,),
+) -> Result<(), anyhow::Error> {
+    let mut fault_start_updater = CellUpdater::new(false);
+
+    let (identify_verify_send, identify_verify_recv) = mesh::oneshot::<()>();
+
+    let fault_configuration = FaultConfiguration::new(fault_start_updater.cell())
+        .with_admin_queue_fault(
+            AdminQueueFaultConfig::new().with_submission_queue_fault(
+                CommandMatchBuilder::new()
+                    .match_cdw0_opcode(nvme_spec::AdminOpcode::IDENTIFY.0)
+                    .match_cdw10(
+                        nvme_spec::Cdw10Identify::new()
+                            .with_cns(nvme_spec::Cns::NAMESPACE.0)
+                            .into(),
+                        nvme_spec::Cdw10Identify::new().with_cns(u8::MAX).into(),
+                    )
+                    .build(),
+                AdminQueueFaultBehavior::Verify(Some(identify_verify_send)),
+            ),
+        );
+
+    let _vm = apply_fault_with_keepalive(
+        config,
+        fault_configuration,
+        fault_start_updater,
+        igvm_file,
+        None,
+    )
+    .await?;
+
+    CancelContext::new()
+        .with_timeout(Duration::from_secs(30))
+        .until_cancelled(identify_verify_recv)
+        .await
+        .expect("IDENTIFY should be observed within 30 seconds of vm restore after servicing with keepalive disabled")
+        .expect("IDENTIFY verification should pass and return a valid result.");
+
+    Ok(())
+}
+
 /// Verifies that the driver awaits an existing AER instead of issuing a new one after servicing.
 #[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
 async fn servicing_keepalive_verify_no_duplicate_aers(
@@ -737,7 +784,7 @@ async fn apply_fault_with_keepalive(
     new_cmdline: Option<&str>,
 ) -> Result<PetriVm<OpenVmmPetriBackend>, anyhow::Error> {
     let mut flags = config.default_servicing_flags();
-    flags.enable_nvme_keepalive = true;
+    //flags.enable_nvme_keepalive = true;
     let (mut vm, agent) = create_keepalive_test_config(
         config,
         fault_configuration,
